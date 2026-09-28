@@ -54,8 +54,8 @@
 #define AUDIO_TIMER_COUNTS       6000U
 
 
-#define SINE_TABLE_SIZE          64U
-#define SINE_TABLE_BITS          6U
+#define SINE_TABLE_SIZE          256U
+#define SINE_TABLE_BITS          8U
 
 
 /* ============================================================
@@ -80,32 +80,61 @@
  * UART / MIDI FILE BUFFER
  * ============================================================
  *
- * This is deliberately small for the first tests.
- *
- * Our simple Twinkle MIDI is far below 1024 bytes.
+ * Deliverable 3: reserve room for a complete MIDI payload up to 16 KiB.
+ * The separate parsed-note array below has its own capacity guard.
  */
 
-#define MAX_MIDI_FILE_SIZE       1024U
+/* SMID v2: byte 5 is opcode (0=MIDI, 1=STOP); v1 MIDI remains accepted.
+ * STOP has zero length/CRC and is recognized only at a header boundary.
+ * MIDI uses a 16-byte header, then an acknowledged raw MIDI payload.
+ * Multi-byte transport fields are little-endian; MIDI itself is unchanged.
+ * Keep these limits coordinated with newmiditst.py.
+ */
+#define MAX_MIDI_FILE_SIZE       16384U
+#define SMID_HEADER_SIZE         16U
+#define SMID_PROTOCOL_VERSION    2U
+#define SMID_LEGACY_VERSION      1U
+#define SMID_COMMAND_MIDI        0U
+#define SMID_COMMAND_STOP        1U
+#define RX_HEADER_TIMEOUT_MS     1000U
+#define RX_PAYLOAD_IDLE_MS       2000U
+#define RX_PAYLOAD_TOTAL_MS      10000U
+#define RX_RECOVERY_QUIET_MS      250U
+#define RX_SERVICE_BYTE_BUDGET   64U
 
 static uint8_t fileBuffer[MAX_MIDI_FILE_SIZE];
-
-static uint8_t lengthBytes[4];
-
-static uint32_t lengthBytesReceived = 0;
-static uint32_t expectedLength = 0;
-static uint32_t bytesReceived = 0;
-
+static uint8_t headerBytes[SMID_HEADER_SIZE];
+static uint32_t headerBytesReceived = 0U;
+static uint32_t magicBytesMatched = 0U;
+static uint32_t expectedLength = 0U;
+static uint32_t bytesReceived = 0U;
+static uint32_t expectedCrc32 = 0U;
+static uint32_t headerStartedMs = 0U;
+static uint32_t payloadStartedMs = 0U;
+static uint32_t lastRxByteMs = 0U;
 
 typedef enum
 {
-    READ_LENGTH = 0,
-    READ_PAYLOAD
-
+    WAIT_MAGIC = 0,
+    READ_HEADER,
+    READ_PAYLOAD,
+    VALIDATE,
+    RECOVER
 } ReceiverState;
 
+static ReceiverState receiverState = WAIT_MAGIC;
 
-static ReceiverState receiverState =
-    READ_LENGTH;
+/* Timer4 supplies time even when Timer2 (audio) is stopped. */
+static volatile uint32_t g_transferMilliseconds = 0U;
+
+/* Optional CCS watch variables. These describe the most recent attempt. */
+volatile uint32_t g_transferSuccessCount = 0U;
+volatile uint32_t g_transferErrorCount = 0U;
+volatile uint32_t g_lastTransferLength = 0U;
+volatile uint32_t g_lastExpectedCrc32 = 0U;
+volatile uint32_t g_lastCalculatedCrc32 = 0U;
+static bool playbackCompletionPending = false;
+
 
 
 /* ============================================================
@@ -113,17 +142,44 @@ static ReceiverState receiverState =
  * ============================================================
  */
 
+/* 256 samples of one cycle: round(8192 + 2500*sin(2*pi*i/256)).
+ * Precomputed constants: no runtime floating-point sine calculation.
+ * The audio ISR retains its existing x3 gain and 20 kHz update rate.
+ */
 static const uint16_t sineTable[SINE_TABLE_SIZE] =
 {
-    8192, 8437, 8680, 8918, 9149, 9370, 9581, 9778,
-    9960, 10125, 10271, 10397, 10502, 10584, 10644, 10680,
-    10692, 10680, 10644, 10584, 10502, 10397, 10271, 10125,
-    9960, 9778, 9581, 9370, 9149, 8918, 8680, 8437,
-
-    8192, 7947, 7704, 7466, 7235, 7014, 6803, 6606,
-    6424, 6259, 6113, 5987, 5882, 5800, 5740, 5704,
-    5692, 5704, 5740, 5800, 5882, 5987, 6113, 6259,
-    6424, 6606, 6803, 7014, 7235, 7466, 7704, 7947
+    8192, 8253, 8315, 8376, 8437, 8498, 8559, 8619,
+    8680, 8740, 8799, 8859, 8918, 8976, 9034, 9092,
+    9149, 9205, 9261, 9316, 9370, 9424, 9477, 9529,
+    9581, 9632, 9681, 9730, 9778, 9825, 9871, 9916,
+    9960, 10003, 10044, 10085, 10125, 10163, 10200, 10236,
+    10271, 10304, 10336, 10367, 10397, 10425, 10452, 10478,
+    10502, 10524, 10546, 10566, 10584, 10601, 10617, 10631,
+    10644, 10655, 10665, 10673, 10680, 10685, 10689, 10691,
+    10692, 10691, 10689, 10685, 10680, 10673, 10665, 10655,
+    10644, 10631, 10617, 10601, 10584, 10566, 10546, 10524,
+    10502, 10478, 10452, 10425, 10397, 10367, 10336, 10304,
+    10271, 10236, 10200, 10163, 10125, 10085, 10044, 10003,
+    9960, 9916, 9871, 9825, 9778, 9730, 9681, 9632,
+    9581, 9529, 9477, 9424, 9370, 9316, 9261, 9205,
+    9149, 9092, 9034, 8976, 8918, 8859, 8799, 8740,
+    8680, 8619, 8559, 8498, 8437, 8376, 8315, 8253,
+    8192, 8131, 8069, 8008, 7947, 7886, 7825, 7765,
+    7704, 7644, 7585, 7525, 7466, 7408, 7350, 7292,
+    7235, 7179, 7123, 7068, 7014, 6960, 6907, 6855,
+    6803, 6752, 6703, 6654, 6606, 6559, 6513, 6468,
+    6424, 6381, 6340, 6299, 6259, 6221, 6184, 6148,
+    6113, 6080, 6048, 6017, 5987, 5959, 5932, 5906,
+    5882, 5860, 5838, 5818, 5800, 5783, 5767, 5753,
+    5740, 5729, 5719, 5711, 5704, 5699, 5695, 5693,
+    5692, 5693, 5695, 5699, 5704, 5711, 5719, 5729,
+    5740, 5753, 5767, 5783, 5800, 5818, 5838, 5860,
+    5882, 5906, 5932, 5959, 5987, 6017, 6048, 6080,
+    6113, 6148, 6184, 6221, 6259, 6299, 6340, 6381,
+    6424, 6468, 6513, 6559, 6606, 6654, 6703, 6752,
+    6803, 6855, 6907, 6960, 7014, 7068, 7123, 7179,
+    7235, 7292, 7350, 7408, 7466, 7525, 7585, 7644,
+    7704, 7765, 7825, 7886, 7947, 8008, 8069, 8131
 };
 
 
@@ -229,11 +285,14 @@ typedef struct
 } MelodyEvent;
 
 
-#define MAX_PARSED_NOTES         64U
+#define MAX_PARSED_NOTES         1024U
 
 static MelodyEvent g_melody[MAX_PARSED_NOTES];
 
 volatile uint32_t g_melodyLength = 0;
+
+/* Reason for the most recent parse failure; reset on every parser entry. */
+static bool g_noteCapacityExceeded = false;
 
 
 /* ============================================================
@@ -276,6 +335,7 @@ static void PlaybackTimer_armMs(
 static void playbackStartCurrentEvent(void);
 
 static void playbackStartMelody(void);
+static void playbackStop(void);
 
 
 /* ============================================================
@@ -548,8 +608,8 @@ void timer2ISR(void)
     if (g_noteActive)
     {
         /*
-         * Use upper 6 phase bits to select
-         * one of 64 sine values.
+         * Use upper 8 phase bits to select
+         * one of 256 sine values.
          */
         tableIndex =
             g_phaseAccumulator >>
@@ -569,7 +629,7 @@ void timer2ISR(void)
          * Keep the quieter amplitude that
          * worked well in your testing.
          */
-        centeredSample /= 4;
+        centeredSample *= 3;
 
 
         /*
@@ -897,6 +957,36 @@ void audioStopMidiNote(void)
 }
 
 
+/* Cancel the entire song, including a scheduled rest. Preserve the caller's
+ * interrupt-mask state; ACK_STOPPED is sent only after this function returns.
+ * Timer4 remains running so transfer timeouts continue to work in silence.
+ */
+static void playbackStop(void)
+{
+    bool interruptsWereDisabled = IntMasterDisable();
+
+    TimerDisable(TIMER3_BASE, TIMER_A);
+    TimerIntClear(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
+    g_playbackActive = false;
+    g_playbackState = PLAYBACK_IDLE;
+    g_melodyIndex = 0U;
+    g_melodyLength = 0U;
+    playbackCompletionPending = false;
+    audioStopMidiNote();
+
+    /* Read back the peripheral clears before clearing latched NVIC requests. */
+    (void)TimerIntStatus(TIMER3_BASE, false);
+    (void)TimerIntStatus(TIMER2_BASE, false);
+    IntPendClear(INT_TIMER3A);
+    IntPendClear(INT_TIMER2A);
+
+    if (!interruptsWereDisabled)
+    {
+        IntMasterEnable();
+    }
+}
+
+
 /* ============================================================
  * NOTE ON
  * ============================================================
@@ -1102,8 +1192,8 @@ static void playbackStartCurrentEvent(void)
     /*
      * End of parsed melody.
      */
-    if (g_melodyIndex >=
-        g_melodyLength)
+    if ((g_melodyIndex >= g_melodyLength) ||
+        (g_melodyIndex >= MAX_PARSED_NOTES))
     {
         /*
          * Extra safety Note Off.
@@ -1164,6 +1254,20 @@ void timer3ISR(void)
         TIMER_TIMA_TIMEOUT
     );
 
+
+    /* A late interrupt after STOP must not advance/restart the melody. */
+    if (!g_playbackActive)
+    {
+        TimerDisable(TIMER3_BASE, TIMER_A);
+        return;
+    }
+    if ((g_melodyLength > MAX_PARSED_NOTES) ||
+        (g_melodyIndex >= g_melodyLength) ||
+        (g_melodyIndex >= MAX_PARSED_NOTES))
+    {
+        playbackStop();
+        return;
+    }
 
     /*
      * ----------------------------------------
@@ -1327,801 +1431,299 @@ void PlaybackTimer_init(void)
 
 static void playbackStartMelody(void)
 {
-    /*
-     * Stop any previous playback.
-     */
-    TimerDisable(
-        TIMER3_BASE,
-        TIMER_A
-    );
+    bool interruptsWereDisabled = IntMasterDisable();
 
-
-    TimerIntClear(
-        TIMER3_BASE,
-        TIMER_TIMA_TIMEOUT
-    );
-
-
+    TimerDisable(TIMER3_BASE, TIMER_A);
+    TimerIntClear(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
     audioStopMidiNote();
+    (void)TimerIntStatus(TIMER3_BASE, false);
+    (void)TimerIntStatus(TIMER2_BASE, false);
+    IntPendClear(INT_TIMER3A);
+    IntPendClear(INT_TIMER2A);
 
-
-    /*
-     * Need at least one parsed note.
-     */
-    if (g_melodyLength == 0U)
+    g_melodyIndex = 0U;
+    g_playbackState = PLAYBACK_IDLE;
+    g_playbackActive = false;
+    if ((g_melodyLength > 0U) && (g_melodyLength <= MAX_PARSED_NOTES))
     {
-        g_playbackState =
-            PLAYBACK_IDLE;
-
-
-        g_playbackActive =
-            false;
-
-
-        return;
+        g_playbackActive = true;
+        playbackStartCurrentEvent();
     }
 
-
-    g_melodyIndex = 0;
-
-
-    g_playbackActive =
-        true;
-
-
-    g_playbackState =
-        PLAYBACK_IDLE;
-
-
-    /*
-     * Start first parsed event.
-     */
-    playbackStartCurrentEvent();
+    if (!interruptsWereDisabled)
+    {
+        IntMasterEnable();
+    }
 }
 
 
 /* ============================================================
- * SIMPLE MIDI TYPE-0 PARSER
+ * DELIVERABLE 5: BOUNDED TYPE-0 MIDI PARSER
  * ============================================================
- *
- * SUPPORTED:
- *
- * - Standard MIDI File Type 0
- * - one track
- * - ticks-per-quarter-note timing
- * - tempo meta event
- * - Note On
- * - Note Off
- * - Note On velocity 0 = Note Off
- * - End Of Track
- *
- * NOT SUPPORTED YET:
- *
- * - running status
- * - chords/polyphony
- * - control changes
- * - program changes
- * - pitch bend
- * - SysEx
- * - SMPTE timing
- *
- * This is intentional for the first prototype.
+ * Contract: one track, PPQN, channel 0, monophonic notes 48..84.
+ * Decode channel running status; Note On velocity 0 ends a note.
+ * Consume/ignore A/B/C/D/E channel events while retaining elapsed time.
+ * Read tempo/EOT; skip other bounded meta events. SysEx remains unsupported.
+ * This parser accepts a complete file before audio playback can start.
  */
 
-static bool parseSimpleMidi(
-    const uint8_t *data,
-    uint32_t fileLength
-)
+/* CCS diagnostics for the most recent parse attempt; no extra UART lines. */
+volatile uint32_t g_lastMidiRunningStatusCount = 0U;
+volatile uint32_t g_lastMidiSkippedChannelEvents = 0U;
+volatile uint32_t g_lastMidiSkippedMetaEvents = 0U;
+
+/* Validate common fixed-size meta events before accessing/skipping their data.
+ * Other meta types are opaque, length-delimited data under this contract.
+ */
+static bool midiMetaLengthValid(uint8_t type, uint32_t length)
 {
-    uint32_t headerLength;
+    switch (type)
+    {
+        case 0x00U: return length == 2U;  /* sequence number */
+        case 0x20U:                     /* channel prefix */
+        case 0x21U: return length == 1U;  /* MIDI port */
+        case 0x2FU: return length == 0U;  /* end of track */
+        case 0x51U: return length == 3U;  /* tempo */
+        case 0x54U: return length == 5U;  /* SMPTE offset metadata */
+        case 0x58U: return length == 4U;  /* time signature */
+        case 0x59U: return length == 2U;  /* key signature */
+        default: return true;            /* text/opaque metadata */
+    }
+}
 
-    uint16_t format;
+static bool midiTimeFitsMilliseconds(uint64_t us)
+{
+    /* Keep the existing millisecond scheduler, but prevent narrowing wrap. */
+    return us <= ((uint64_t)UINT32_MAX * 1000ULL + 499ULL);
+}
 
-    uint16_t numberOfTracks;
-
-    uint16_t division;
-
-
-    uint32_t trackOffset;
-
-    uint32_t trackLength;
-
+static bool parseSimpleMidi(const uint8_t *data, uint32_t fileLength)
+{
     uint32_t index;
-
     uint32_t trackEnd;
-
-
-    /*
-     * Standard MIDI default tempo:
-     *
-     * 500,000 microseconds / quarter note
-     *
-     * = 120 BPM
-     */
-    uint32_t tempoUsPerQuarter =
-        500000U;
-
-
-    /*
-     * Absolute playback time while parsing.
-     */
-    uint64_t currentTimeUs = 0;
-
-
-    /*
-     * When did the active note begin?
-     */
-    uint64_t noteStartTimeUs = 0;
-
-
-    /*
-     * Used to calculate rests.
-     */
-    uint64_t lastNoteOffTimeUs = 0;
-
-
+    uint32_t tempoUsPerQuarter = 500000U;
+    uint32_t tickFraction = 0U;
+    uint16_t division;
+    uint64_t currentTimeUs = 0ULL;
+    uint64_t noteStartTimeUs = 0ULL;
+    uint64_t lastNoteOffTimeUs = 0ULL;
+    uint8_t runningStatus = 0U;
+    uint8_t activeNote = MIDI_NOTE_NONE;
     bool parserNoteActive = false;
 
+    g_melodyLength = 0U;
+    g_noteCapacityExceeded = false;
+    g_lastMidiRunningStatusCount = 0U;
+    g_lastMidiSkippedChannelEvents = 0U;
+    g_lastMidiSkippedMetaEvents = 0U;
 
-    uint8_t activeNote =
-        MIDI_NOTE_NONE;
-
-
-    /*
-     * Start with an empty parsed melody.
-     */
-    g_melodyLength = 0;
-
-
-    /* ========================================================
-     * MIDI HEADER
-     * ========================================================
-     */
-
-    if (fileLength < 22U)
+    /* Project subset: standard six-byte header, exactly one Type-0 track. */
+    if ((fileLength < 22U) || (memcmp(data, "MThd", 4U) != 0) ||
+        (readBigEndian32(&data[4]) != 6U) ||
+        (readBigEndian16(&data[8]) != 0U) ||
+        (readBigEndian16(&data[10]) != 1U))
     {
         return false;
     }
-
-
-    /*
-     * Standard MIDI file must start:
-     *
-     * MThd
-     */
-    if (memcmp(
-            data,
-            "MThd",
-            4
-        ) != 0)
+    division = readBigEndian16(&data[12]);
+    if ((division == 0U) || ((division & 0x8000U) != 0U) ||
+        (memcmp(&data[14], "MTrk", 4U) != 0))
     {
         return false;
     }
-
-
-    /*
-     * MIDI header chunk size.
-     */
-    headerLength =
-        readBigEndian32(
-            &data[4]
-        );
-
-
-    /*
-     * Standard header body is 6 bytes.
-     */
-    if (headerLength != 6U)
+    index = 22U;
+    /* Exact equality also rejects extra chunks/bytes outside our one track. */
+    if (readBigEndian32(&data[18]) != (fileLength - index))
     {
         return false;
     }
-
-
-    format =
-        readBigEndian16(
-            &data[8]
-        );
-
-
-    numberOfTracks =
-        readBigEndian16(
-            &data[10]
-        );
-
-
-    division =
-        readBigEndian16(
-            &data[12]
-        );
-
-
-    /*
-     * First parser supports Type 0 only.
-     */
-    if (format != 0U)
-    {
-        return false;
-    }
-
-
-    /*
-     * Type 0 should contain one track.
-     */
-    if (numberOfTracks != 1U)
-    {
-        return false;
-    }
-
-
-    /*
-     * Reject:
-     *
-     * division = 0
-     *
-     * or SMPTE timing.
-     */
-    if ((division == 0U) ||
-        ((division & 0x8000U) != 0U))
-    {
-        return false;
-    }
-
-
-    /* ========================================================
-     * TRACK HEADER
-     * ========================================================
-     */
-
-    trackOffset =
-        8U + headerLength;
-
-
-    /*
-     * Need room for:
-     *
-     * MTrk + 4-byte length
-     */
-    if ((trackOffset + 8U) >
-        fileLength)
-    {
-        return false;
-    }
-
-
-    if (memcmp(
-            &data[trackOffset],
-            "MTrk",
-            4
-        ) != 0)
-    {
-        return false;
-    }
-
-
-    trackLength =
-        readBigEndian32(
-            &data[trackOffset + 4U]
-        );
-
-
-    /*
-     * First track-data byte.
-     */
-    index =
-        trackOffset + 8U;
-
-
-    /*
-     * Avoid overflow / invalid track size.
-     */
-    if (trackLength >
-        (fileLength - index))
-    {
-        return false;
-    }
-
-
-    trackEnd =
-        index + trackLength;
-
-
-    /* ========================================================
-     * PARSE TRACK EVENTS
-     * ========================================================
-     */
+    trackEnd = fileLength;
 
     while (index < trackEnd)
     {
         uint32_t deltaTicks;
-
+        uint64_t numerator;
         uint64_t deltaUs;
-
         uint8_t status;
+        uint8_t kind;
+        uint32_t dataLength;
+        uint32_t i;
+        uint8_t first;
+        uint8_t second;
 
-
-        /*
-         * Every MIDI event begins with a
-         * variable-length delta time.
-         */
-        if (!readMidiVLQ(
-                data,
-                trackEnd,
-                &index,
-                &deltaTicks))
+        if (!readMidiVLQ(data, trackEnd, &index, &deltaTicks))
         {
             return false;
         }
-
-
-        /*
-         * Convert MIDI ticks to real time:
-         *
-         * deltaUs =
-         *
-         * deltaTicks * tempo
-         * ------------------
-         *      division
+        /* Include every event's delta, even if its musical effect is ignored.
+         * Carry the fractional microsecond: subdividing a wait into controller
+         * events must not lose one rounding remainder per ignored event.
          */
-        deltaUs =
-            (
-                (uint64_t)deltaTicks *
-                tempoUsPerQuarter
-            )
-            /
-            division;
-
-
-        /*
-         * Keep an absolute real-time position.
-         */
-        currentTimeUs +=
-            deltaUs;
-
-
+        numerator = (uint64_t)deltaTicks * tempoUsPerQuarter + tickFraction;
+        deltaUs = numerator / division;
+        tickFraction = (uint32_t)(numerator % division);
+        if (deltaUs > (UINT64_MAX - currentTimeUs))
+        {
+            return false;
+        }
+        currentTimeUs += deltaUs;
         if (index >= trackEnd)
         {
             return false;
         }
 
-
-        /*
-         * Read event status.
-         */
-        status =
-            data[index++];
-
-
-        /* ====================================================
-         * META EVENT
-         * ====================================================
-         */
+        status = data[index];
+        if (status < 0x80U)
+        {
+            if (runningStatus == 0U)
+            {
+                return false;
+            }
+            status = runningStatus;
+            /* The current byte is the first data byte; do not consume it yet. */
+            g_lastMidiRunningStatusCount++;
+        }
+        else
+        {
+            index++;
+            if (status < 0xF0U)
+            {
+                runningStatus = status; /* includes message kind AND channel */
+            }
+            else
+            {
+                /* In SMF, meta/SysEx events cancel channel running status. */
+                runningStatus = 0U;
+            }
+        }
 
         if (status == 0xFFU)
         {
             uint8_t metaType;
-
             uint32_t metaLength;
-
-
             if (index >= trackEnd)
             {
                 return false;
             }
-
-
-            metaType =
-                data[index++];
-
-
-            /*
-             * Meta-event data length is itself a VLQ.
-             */
-            if (!readMidiVLQ(
-                    data,
-                    trackEnd,
-                    &index,
-                    &metaLength))
+            metaType = data[index++];
+            if ((metaType >= 0x80U) ||
+                !readMidiVLQ(data, trackEnd, &index, &metaLength) ||
+                (metaLength > (trackEnd - index)) ||
+                !midiMetaLengthValid(metaType, metaLength))
             {
                 return false;
             }
-
-
-            if (metaLength >
-                (trackEnd - index))
-            {
-                return false;
-            }
-
-
-            /*
-             * ----------------------------------------
-             * TEMPO
-             *
-             * FF 51 03 TT TT TT
-             * ----------------------------------------
-             */
             if (metaType == 0x51U)
             {
-                if (metaLength != 3U)
-                {
-                    return false;
-                }
-
-
-                tempoUsPerQuarter =
-                    ((uint32_t)data[index] << 16) |
-                    ((uint32_t)data[index + 1U] << 8) |
-                    ((uint32_t)data[index + 2U]);
-
-
-                /*
-                 * Zero tempo makes no sense.
-                 */
+                tempoUsPerQuarter = ((uint32_t)data[index] << 16) |
+                                    ((uint32_t)data[index + 1U] << 8) |
+                                    (uint32_t)data[index + 2U];
                 if (tempoUsPerQuarter == 0U)
                 {
                     return false;
                 }
             }
-
-
-            /*
-             * ----------------------------------------
-             * END OF TRACK
-             *
-             * FF 2F 00
-             * ----------------------------------------
-             */
             else if (metaType == 0x2FU)
             {
-                /*
-                 * End Of Track should contain
-                 * no data bytes.
-                 */
-                if (metaLength != 0U)
-                {
-                    return false;
-                }
-
-
-                /*
-                 * We must not finish while a
-                 * MIDI note is still active.
-                 */
-                if (parserNoteActive)
-                {
-                    return false;
-                }
-
-
-                /*
-                 * Successful file requires
-                 * at least one parsed note.
-                 */
-                return
-                    (g_melodyLength > 0U);
+                /* EOT must be the final event, with every note already ended. */
+                return (!parserNoteActive && (g_melodyLength > 0U) &&
+                        (index == trackEnd));
             }
-
-
-            /*
-             * Skip the meta-event data.
-             *
-             * This means harmless events such as
-             * a track name can exist without the
-             * parser needing to understand them.
-             */
-            index +=
-                metaLength;
-
-
+            else
+            {
+                if (((metaType == 0x20U) && (data[index] > 15U)) ||
+                    ((metaType == 0x21U) && (data[index] > 127U)))
+                {
+                    return false;
+                }
+                g_lastMidiSkippedMetaEvents++;
+            }
+            index += metaLength;
             continue;
         }
 
-
-        /* ====================================================
-         * RUNNING STATUS
-         * ====================================================
-         *
-         * Data bytes have bit 7 = 0.
-         *
-         * If we encounter one where we expected
-         * a status byte, this file is using MIDI
-         * running status.
-         *
-         * We intentionally do not support that yet.
+        /* Channel messages only. F0/F7 SysEx and raw system statuses are not
+         * part of the agreed input subset, so reject instead of guessing.
+         * Channel 0 in bytes corresponds to channel 1 in many music programs.
          */
-
-        if (status < 0x80U)
+        if ((status >= 0xF0U) || ((status & 0x0FU) != 0U))
         {
             return false;
         }
-
-
-        /* ====================================================
-         * NOTE ON
-         *
-         * Status high nibble = 0x9
-         * ====================================================
-         */
-
-        if ((status & 0xF0U) ==
-            0x90U)
+        kind = status & 0xF0U;
+        dataLength = ((kind == 0xC0U) || (kind == 0xD0U)) ? 1U : 2U;
+        if (dataLength > (trackEnd - index))
         {
-            uint8_t note;
-
-            uint8_t velocity;
-
-
-            if ((index + 2U) >
-                trackEnd)
+            return false;
+        }
+        for (i = 0U; i < dataLength; i++)
+        {
+            if (data[index + i] >= 0x80U)
             {
                 return false;
             }
+        }
+        first = data[index];
+        second = (dataLength == 2U) ? data[index + 1U] : 0U;
+        index += dataLength;
 
-
-            note =
-                data[index++];
-
-
-            velocity =
-                data[index++];
-
-
-            /*
-             * MIDI convention:
-             *
-             * NOTE ON + velocity 0
-             *
-             * is equivalent to NOTE OFF.
+        if ((kind != 0x80U) && (kind != 0x90U))
+        {
+            /* A0/B0/C0/D0/E0: pressure, controllers, programs, pitch bend.
+             * Consume correctly but do not implement their synthesis effects.
              */
-            if (velocity == 0U)
-            {
-                /*
-                 * It must match our current note.
-                 */
-                if ((!parserNoteActive) ||
-                    (note != activeNote))
-                {
-                    return false;
-                }
-
-
-                /*
-                 * Make sure parsed melody array
-                 * has enough room.
-                 */
-                if (g_melodyLength >=
-                    MAX_PARSED_NOTES)
-                {
-                    return false;
-                }
-
-
-                /*
-                 * Store completed note.
-                 */
-                g_melody[
-                    g_melodyLength
-                ].midiNote =
-                    activeNote;
-
-
-                g_melody[
-                    g_melodyLength
-                ].durationMs =
-                    microsecondsToMilliseconds(
-                        currentTimeUs -
-                        noteStartTimeUs
-                    );
-
-
-                g_melody[
-                    g_melodyLength
-                ].restAfterMs =
-                    0U;
-
-
-                g_melodyLength++;
-
-
-                parserNoteActive =
-                    false;
-
-
-                activeNote =
-                    MIDI_NOTE_NONE;
-
-
-                lastNoteOffTimeUs =
-                    currentTimeUs;
-            }
-
-            else
-            {
-                /*
-                 * Current project is monophonic.
-                 *
-                 * Therefore another note cannot
-                 * start while one is still active.
-                 */
-                if (parserNoteActive)
-                {
-                    return false;
-                }
-
-
-                /*
-                 * Stay inside the note range
-                 * supported by our oscillator.
-                 */
-                if ((note < MIDI_NOTE_MIN) ||
-                    (note > MIDI_NOTE_MAX))
-                {
-                    return false;
-                }
-
-
-                /*
-                 * If at least one previous note exists,
-                 * the gap between its Note Off and this
-                 * Note On is a musical REST.
-                 */
-                if (g_melodyLength > 0U)
-                {
-                    g_melody[
-                        g_melodyLength - 1U
-                    ].restAfterMs =
-                        microsecondsToMilliseconds(
-                            currentTimeUs -
-                            lastNoteOffTimeUs
-                        );
-                }
-
-
-                /*
-                 * Begin new note.
-                 */
-                activeNote =
-                    note;
-
-
-                noteStartTimeUs =
-                    currentTimeUs;
-
-
-                parserNoteActive =
-                    true;
-            }
-
-
+            g_lastMidiSkippedChannelEvents++;
             continue;
         }
-
-
-        /* ====================================================
-         * NOTE OFF
-         *
-         * Status high nibble = 0x8
-         * ====================================================
-         */
-
-        if ((status & 0xF0U) ==
-            0x80U)
+        if ((kind == 0x90U) && (second != 0U))
         {
-            uint8_t note;
-
-            uint8_t velocity;
-
-
-            if ((index + 2U) >
-                trackEnd)
+            uint64_t restUs;
+            if (parserNoteActive || (first < MIDI_NOTE_MIN) || (first > MIDI_NOTE_MAX))
             {
                 return false;
             }
-
-
-            note =
-                data[index++];
-
-
-            velocity =
-                data[index++];
-
-
-            /*
-             * We aren't using Note Off velocity
-             * yet.
-             */
-            (void)velocity;
-
-
-            /*
-             * Note Off must match the note that
-             * is currently active.
-             */
-            if ((!parserNoteActive) ||
-                (note != activeNote))
+            if (g_melodyLength > 0U)
+            {
+                restUs = currentTimeUs - lastNoteOffTimeUs;
+                if (!midiTimeFitsMilliseconds(restUs))
+                {
+                    return false;
+                }
+                g_melody[g_melodyLength - 1U].restAfterMs =
+                    microsecondsToMilliseconds(restUs);
+            }
+            activeNote = first;
+            noteStartTimeUs = currentTimeUs;
+            parserNoteActive = true;
+        }
+        else
+        {
+            uint64_t durationUs;
+            /* Both Note Off encodings use this one bounded append path. */
+            if (!parserNoteActive || (first != activeNote))
             {
                 return false;
             }
-
-
-            if (g_melodyLength >=
-                MAX_PARSED_NOTES)
+            if (g_melodyLength >= MAX_PARSED_NOTES)
+            {
+                g_noteCapacityExceeded = true;
+                return false;
+            }
+            durationUs = currentTimeUs - noteStartTimeUs;
+            if (!midiTimeFitsMilliseconds(durationUs))
             {
                 return false;
             }
-
-
-            /*
-             * Store completed note.
-             */
-            g_melody[
-                g_melodyLength
-            ].midiNote =
-                activeNote;
-
-
-            /*
-             * Note duration =
-             *
-             * Note Off time - Note On time.
-             */
-            g_melody[
-                g_melodyLength
-            ].durationMs =
-                microsecondsToMilliseconds(
-                    currentTimeUs -
-                    noteStartTimeUs
-                );
-
-
-            /*
-             * Rest is initially zero.
-             *
-             * If the next Note On happens later,
-             * we will fill this value then.
-             */
-            g_melody[
-                g_melodyLength
-            ].restAfterMs =
-                0U;
-
-
+            g_melody[g_melodyLength].midiNote = activeNote;
+            g_melody[g_melodyLength].durationMs = microsecondsToMilliseconds(durationUs);
+            g_melody[g_melodyLength].restAfterMs = 0U;
             g_melodyLength++;
-
-
-            /*
-             * Explicitly end parser-side note state.
-             */
-            parserNoteActive =
-                false;
-
-
-            activeNote =
-                MIDI_NOTE_NONE;
-
-
-            lastNoteOffTimeUs =
-                currentTimeUs;
-
-
-            continue;
+            parserNoteActive = false;
+            activeNote = MIDI_NOTE_NONE;
+            lastNoteOffTimeUs = currentTimeUs;
         }
-
-
-        /*
-         * Any other MIDI event is intentionally
-         * unsupported by this first parser.
-         */
-        return false;
     }
-
-
-    /*
-     * Reaching the physical end without an
-     * End Of Track event is treated as invalid.
-     */
-    return false;
+    return false; /* missing End Of Track */
 }
 
 
@@ -2232,273 +1834,438 @@ static void UART0_writeString(
 
 
 /* ============================================================
- * RESET UART FILE RECEIVER
- * ============================================================
+ * DELIVERABLE 2: TRANSFER CLOCK, CRC AND RECOVERABLE UART RECEIVER
+ * ============================================================ */
+
+static void transferTimer4ISR(void)
+{
+    TimerIntClear(TIMER4_BASE, TIMER_TIMA_TIMEOUT);
+    g_transferMilliseconds++;
+}
+
+static void TransferClock_init(void)
+{
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER4);
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER4))
+    {
+    }
+
+    TimerDisable(TIMER4_BASE, TIMER_A);
+    TimerConfigure(TIMER4_BASE, TIMER_CFG_PERIODIC);
+    TimerClockSourceSet(TIMER4_BASE, TIMER_CLOCK_SYSTEM);
+    TimerLoadSet(TIMER4_BASE, TIMER_A, (SYSTEM_CLOCK_HZ / 1000U) - 1U);
+    TimerIntRegister(TIMER4_BASE, TIMER_A, transferTimer4ISR);
+    TimerIntClear(TIMER4_BASE, TIMER_TIMA_TIMEOUT);
+    g_transferMilliseconds = 0U;
+    TimerIntEnable(TIMER4_BASE, TIMER_TIMA_TIMEOUT);
+    TimerEnable(TIMER4_BASE, TIMER_A);
+}
+
+static uint32_t readLittleEndian32(const uint8_t *data)
+{
+    return ((uint32_t)data[0]) |
+           ((uint32_t)data[1] << 8U) |
+           ((uint32_t)data[2] << 16U) |
+           ((uint32_t)data[3] << 24U);
+}
+
+/* CRC-32/ISO-HDLC, matching zlib.crc32(data).
+ * ASCII "123456789" must produce 0xCBF43926.
  */
+static uint32_t midiPayloadCrc32(const uint8_t *data, uint32_t length)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    uint32_t i;
+    uint32_t bit;
+
+    for (i = 0U; i < length; i++)
+    {
+        crc ^= (uint32_t)data[i];
+        for (bit = 0U; bit < 8U; bit++)
+        {
+            if ((crc & 1U) != 0U)
+            {
+                crc = (crc >> 1U) ^ 0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1U;
+            }
+        }
+    }
+    return crc ^ 0xFFFFFFFFU;
+}
+
+/* Small formatters avoid pulling printf into the embedded build. */
+static void UART0_writeDecimal(uint32_t value)
+{
+    char digits[10];
+    uint32_t count = 0U;
+    do
+    {
+        digits[count++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value != 0U);
+
+    while (count != 0U)
+    {
+        UARTCharPut(UART0_BASE, digits[--count]);
+    }
+}
+
+static void UART0_writeHex32(uint32_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t shift;
+    for (shift = 32U; shift != 0U; shift -= 4U)
+    {
+        UARTCharPut(UART0_BASE, hex[(value >> (shift - 4U)) & 0xFU]);
+    }
+}
+
+static void UART0_writeTransferAck(const char *name,
+                                  uint32_t length,
+                                  uint32_t crc)
+{
+    UART0_writeString(name);
+    UARTCharPut(UART0_BASE, ' ');
+    UART0_writeDecimal(length);
+    UARTCharPut(UART0_BASE, ' ');
+    UART0_writeHex32(crc);
+    UART0_writeString("\r\n");
+}
 
 static void UARTReceiver_reset(void)
 {
-    lengthBytesReceived = 0;
-
-    expectedLength = 0;
-
-    bytesReceived = 0;
-
-    receiverState =
-        READ_LENGTH;
+    headerBytesReceived = 0U;
+    magicBytesMatched = 0U;
+    expectedLength = 0U;
+    bytesReceived = 0U;
+    expectedCrc32 = 0U;
+    headerStartedMs = 0U;
+    payloadStartedMs = 0U;
+    lastRxByteMs = g_transferMilliseconds;
+    receiverState = WAIT_MAGIC;
 }
 
+static void UARTReceiver_fail(const char *error)
+{
+    /* One error line per failed attempt, even if more bad bytes arrive.
+     * Never stop an already playing melody in this routine: ERR_BUSY and
+     * UART noise during playback must not modify the active melody.
+     */
+    if (receiverState == RECOVER)
+    {
+        lastRxByteMs = g_transferMilliseconds;
+        return;
+    }
+
+    g_transferErrorCount++;
+    UARTReceiver_reset();
+    receiverState = RECOVER;
+    UART0_writeString(error);
+    UART0_writeString("\r\n");
+    lastRxByteMs = g_transferMilliseconds;
+}
+
+static void UARTReceiver_checkTimeout(void)
+{
+    uint32_t now = g_transferMilliseconds;
+
+    /* Unsigned subtraction also works when the millisecond counter wraps. */
+    if (((receiverState == READ_HEADER) ||
+         ((receiverState == WAIT_MAGIC) && (magicBytesMatched != 0U))) &&
+        ((uint32_t)(now - headerStartedMs) >= RX_HEADER_TIMEOUT_MS))
+    {
+        UARTReceiver_fail("ERR_TIMEOUT");
+    }
+    else if ((receiverState == READ_PAYLOAD) &&
+             (((uint32_t)(now - lastRxByteMs) >= RX_PAYLOAD_IDLE_MS) ||
+              ((uint32_t)(now - payloadStartedMs) >= RX_PAYLOAD_TOTAL_MS)))
+    {
+        UARTReceiver_fail("ERR_TIMEOUT");
+    }
+    else if ((receiverState == RECOVER) &&
+             !UARTCharsAvail(UART0_BASE) &&
+             ((uint32_t)(now - lastRxByteMs) >= RX_RECOVERY_QUIET_MS))
+    {
+        UARTReceiver_reset();
+        /* IDLE means the receiver accepts another header. Playback may
+         * still be active after ERR_BUSY; that next header will be refused.
+         */
+        UART0_writeString("IDLE\r\n");
+    }
+}
+
+static void UARTReceiver_acceptHeader(void)
+{
+    uint8_t version = headerBytes[4];
+    uint8_t command = headerBytes[5];
+
+    if ((version != SMID_PROTOCOL_VERSION) && (version != SMID_LEGACY_VERSION))
+    {
+        UARTReceiver_fail("ERR_VERSION");
+        return;
+    }
+    if ((headerBytes[6] != 0U) || (headerBytes[7] != 0U) ||
+        ((version == SMID_LEGACY_VERSION) && (command != SMID_COMMAND_MIDI)))
+    {
+        UARTReceiver_fail("ERR_HEADER");
+        return;
+    }
+    if ((command != SMID_COMMAND_MIDI) && (command != SMID_COMMAND_STOP))
+    {
+        UARTReceiver_fail("ERR_COMMAND");
+        return;
+    }
+    if (command == SMID_COMMAND_STOP)
+    {
+        if ((readLittleEndian32(&headerBytes[8]) != 0U) ||
+            (readLittleEndian32(&headerBytes[12]) != 0U))
+        {
+            UARTReceiver_fail("ERR_HEADER");
+            return;
+        }
+        playbackStop();
+        UARTReceiver_reset();
+        UART0_writeString("ACK_STOPPED\r\nIDLE\r\n");
+        return;
+    }
+
+    expectedLength = readLittleEndian32(&headerBytes[8]);
+    expectedCrc32 = readLittleEndian32(&headerBytes[12]);
+    g_lastTransferLength = expectedLength;
+    g_lastExpectedCrc32 = expectedCrc32;
+    g_lastCalculatedCrc32 = 0U;
+
+    if ((expectedLength == 0U) || (expectedLength > MAX_MIDI_FILE_SIZE))
+    {
+        UARTReceiver_fail("ERR_SIZE");
+        return;
+    }
+    if (g_playbackActive)
+    {
+        UARTReceiver_fail("ERR_BUSY");
+        return;
+    }
+
+    bytesReceived = 0U;
+    receiverState = READ_PAYLOAD;
+    UART0_writeTransferAck("ACK_READY", expectedLength, expectedCrc32);
+    /* Start after queuing the acknowledgement, giving the host a full
+     * idle interval to receive it and begin sending the payload.
+     */
+    payloadStartedMs = g_transferMilliseconds;
+    lastRxByteMs = payloadStartedMs;
+}
+
+static void UARTReceiver_processByte(uint8_t byte)
+{
+    static const uint8_t magic[4] = {'S', 'M', 'I', 'D'};
+    uint32_t now = g_transferMilliseconds;
+    lastRxByteMs = now;
+
+    if (receiverState == RECOVER)
+    {
+        return;
+    }
+
+    if (receiverState == WAIT_MAGIC)
+    {
+        if (byte == magic[magicBytesMatched])
+        {
+            if (magicBytesMatched == 0U)
+            {
+                headerStartedMs = now;
+            }
+            magicBytesMatched++;
+            if (magicBytesMatched == 4U)
+            {
+                memcpy(headerBytes, magic, sizeof(magic));
+                headerBytesReceived = 4U;
+                magicBytesMatched = 0U;
+                receiverState = READ_HEADER;
+            }
+        }
+        else if (byte == magic[0])
+        {
+            /* Preserve a new 'S', e.g. the second S in "SSMID". */
+            magicBytesMatched = 1U;
+            headerStartedMs = now;
+        }
+        else
+        {
+            magicBytesMatched = 0U;
+        }
+        return;
+    }
+
+    if (receiverState == READ_HEADER)
+    {
+        if (headerBytesReceived >= SMID_HEADER_SIZE)
+        {
+            UARTReceiver_fail("ERR_HEADER");
+            return;
+        }
+        headerBytes[headerBytesReceived++] = byte;
+        if (headerBytesReceived == SMID_HEADER_SIZE)
+        {
+            UARTReceiver_acceptHeader();
+        }
+        return;
+    }
+
+    if (receiverState == READ_PAYLOAD)
+    {
+        if ((bytesReceived >= expectedLength) ||
+            (bytesReceived >= MAX_MIDI_FILE_SIZE))
+        {
+            UARTReceiver_fail("ERR_SIZE");
+            return;
+        }
+        /* All payload bytes are data: do not look for SMID or commands. */
+        fileBuffer[bytesReceived++] = byte;
+        if (bytesReceived == expectedLength)
+        {
+            receiverState = VALIDATE;
+        }
+    }
+}
+
+static void UARTReceiver_validate(void)
+{
+    uint32_t actualCrc;
+    if (receiverState != VALIDATE)
+    {
+        return;
+    }
+
+    /* The host must wait for the result before sending anything else. */
+    if (UARTCharsAvail(UART0_BASE))
+    {
+        UARTReceiver_fail("ERR_SIZE");
+        return;
+    }
+    actualCrc = midiPayloadCrc32(fileBuffer, expectedLength);
+    g_lastCalculatedCrc32 = actualCrc;
+    if (actualCrc != expectedCrc32)
+    {
+        UARTReceiver_fail("ERR_CRC");
+        return;
+    }
+
+    UART0_writeTransferAck("ACK_RECEIVED", expectedLength, actualCrc);
+    if (!parseSimpleMidi(fileBuffer, expectedLength))
+    {
+        /* Parsing is reached only after accepting a header while idle. */
+        playbackStop();
+        UARTReceiver_fail(g_noteCapacityExceeded ?
+                          "ERR_NOTE_CAPACITY" : "ERR_MIDI");
+        return;
+    }
+
+    g_transferSuccessCount++;
+    UART0_writeString("ACK_VALID\r\n");
+    UARTReceiver_reset();
+    playbackStartMelody();
+    playbackCompletionPending = true;
+    UART0_writeString("PLAYING\r\n");
+}
+
+static void UARTReceiver_service(void)
+{
+    uint32_t count;
+    uint32_t uartErrors;
+    int32_t rawByte;
+
+    /* This call runs even when no bytes arrive. */
+    UARTReceiver_checkTimeout();
+
+    uartErrors = UARTRxErrorGet(UART0_BASE);
+    if (uartErrors != 0U)
+    {
+        UARTRxErrorClear(UART0_BASE);
+        UARTReceiver_fail("ERR_UART");
+    }
+
+    /* Bounded work keeps the clock and completion checks responsive. */
+    for (count = 0U; count < RX_SERVICE_BYTE_BUDGET; count++)
+    {
+        if (!UARTCharsAvail(UART0_BASE))
+        {
+            break;
+        }
+        UARTReceiver_checkTimeout();
+        rawByte = UARTCharGetNonBlocking(UART0_BASE);
+        if (rawByte < 0)
+        {
+            break;
+        }
+
+        /* UART data-register bits 11:8 contain per-character error flags.
+         * Inspect them before converting the word to an 8-bit payload.
+         */
+        uartErrors = UARTRxErrorGet(UART0_BASE);
+        if ((((uint32_t)rawByte & 0x00000F00U) != 0U) ||
+            (uartErrors != 0U))
+        {
+            UARTRxErrorClear(UART0_BASE);
+            UARTReceiver_fail("ERR_UART");
+            lastRxByteMs = g_transferMilliseconds;
+            continue;
+        }
+
+        UARTReceiver_processByte((uint8_t)rawByte);
+        if (receiverState == VALIDATE)
+        {
+            break;
+        }
+    }
+
+    /* Also catch an overrun reported immediately after the last read. */
+    if (UARTRxErrorGet(UART0_BASE) != 0U)
+    {
+        UARTRxErrorClear(UART0_BASE);
+        UARTReceiver_fail("ERR_UART");
+    }
+    UARTReceiver_checkTimeout();
+    UARTReceiver_validate();
+
+    /* Never print from the audio or note-scheduler interrupt handlers. */
+    if (playbackCompletionPending && !g_playbackActive)
+    {
+        playbackCompletionPending = false;
+        UART0_writeString("DONE\r\n");
+        if ((receiverState == WAIT_MAGIC) && (magicBytesMatched == 0U))
+        {
+            UART0_writeString("IDLE\r\n");
+        }
+    }
+}
 
 /* ============================================================
  * MAIN THREAD
- * ============================================================
- */
+ * ============================================================ */
 
 void *mainThread(void *arg0)
 {
     (void)arg0;
-
-
-    /*
-     * TI GPIO setup.
-     */
     GPIO_init();
 
-
-    /*
-     * Configure:
-     *
-     * SSI2
-     * DAC8311
-     * DAC SYNC
-     * PH2 amplifier control
-     */
+    /* Preserve the proven audio hardware, PH2 control and timer setup. */
     Audio_init();
-
-
-    /*
-     * Timer2:
-     *
-     * 20 kHz waveform/sample generation.
-     */
     AudioTimer_init();
-
-
-    /*
-     * Timer3:
-     *
-     * MIDI note durations and rests.
-     */
     PlaybackTimer_init();
 
-
-    /*
-     * UART:
-     *
-     * Receive the complete MIDI file.
-     */
+    /* Timer4 is reserved for the transfer clock; no SysConfig edit. */
+    TransferClock_init();
     UART0_init();
-
-
-    /*
-     * Make sure receiver starts clean.
-     */
+    UARTRxErrorClear(UART0_BASE);
     UARTReceiver_reset();
-
-
-    UART0_writeString(
-        "\r\nMSP432 MIDI player ready\r\n"
-    );
-
+    UART0_writeString("\r\nSMID v2 READY\r\nIDLE\r\n");
 
     while (1)
     {
-        /*
-         * Has one UART byte arrived?
-         */
-        if (UARTCharsAvail(
-                UART0_BASE))
-        {
-            uint8_t receivedByte;
-
-
-            receivedByte =
-                (uint8_t)UARTCharGet(
-                    UART0_BASE
-                );
-
-
-            /* =================================================
-             * STATE 1:
-             *
-             * RECEIVE 4-BYTE FILE LENGTH
-             * =================================================
-             *
-             * Python sends:
-             *
-             * [little-endian length][raw MIDI]
-             */
-
-            if (receiverState ==
-                READ_LENGTH)
-            {
-                lengthBytes[
-                    lengthBytesReceived
-                ] =
-                    receivedByte;
-
-
-                lengthBytesReceived++;
-
-
-                /*
-                 * Have all four length bytes arrived?
-                 */
-                if (lengthBytesReceived ==
-                    4U)
-                {
-                    /*
-                     * Convert little-endian bytes
-                     * into uint32_t.
-                     */
-                    expectedLength =
-                        ((uint32_t)lengthBytes[0]) |
-                        ((uint32_t)lengthBytes[1] << 8) |
-                        ((uint32_t)lengthBytes[2] << 16) |
-                        ((uint32_t)lengthBytes[3] << 24);
-
-
-                    /*
-                     * Make sure the complete MIDI file
-                     * can fit into our RAM buffer.
-                     */
-                    if ((expectedLength == 0U) ||
-                        (expectedLength >
-                         MAX_MIDI_FILE_SIZE))
-                    {
-                        UART0_writeString(
-                            "ERROR: invalid MIDI file size\r\n"
-                        );
-
-
-                        UARTReceiver_reset();
-                    }
-                    else
-                    {
-                        /*
-                         * Start receiving raw MIDI bytes.
-                         */
-                        bytesReceived = 0;
-
-
-                        receiverState =
-                            READ_PAYLOAD;
-                    }
-                }
-            }
-
-
-            /* =================================================
-             * STATE 2:
-             *
-             * RECEIVE RAW MIDI FILE
-             * =================================================
-             */
-
-            else if (receiverState ==
-                     READ_PAYLOAD)
-            {
-                fileBuffer[
-                    bytesReceived
-                ] =
-                    receivedByte;
-
-
-                bytesReceived++;
-
-
-                /*
-                 * Has the entire MIDI file arrived?
-                 */
-                if (bytesReceived ==
-                    expectedLength)
-                {
-                    uint32_t completedLength;
-
-
-                    /*
-                     * Save the length BEFORE resetting
-                     * the receiver state.
-                     */
-                    completedLength =
-                        expectedLength;
-
-
-                    UART0_writeString(
-                        "Transfer complete\r\n"
-                    );
-
-
-                    /*
-                     * Receiver is ready for another
-                     * transfer later.
-                     */
-                    UARTReceiver_reset();
-
-
-                    /*
-                     * Parse raw MIDI bytes into our
-                     * simple g_melody[] structure.
-                     */
-                    if (parseSimpleMidi(
-                            fileBuffer,
-                            completedLength))
-                    {
-                        UART0_writeString(
-                            "MIDI parse: PASS\r\n"
-                        );
-
-
-                        UART0_writeString(
-                            "Starting playback\r\n"
-                        );
-
-
-                        /*
-                         * Timer3 now plays the notes
-                         * created by the parser.
-                         */
-                        playbackStartMelody();
-                    }
-                    else
-                    {
-                        /*
-                         * Failed parse must always leave
-                         * audio safely OFF.
-                         */
-                        audioStopMidiNote();
-
-
-                        TimerDisable(
-                            TIMER3_BASE,
-                            TIMER_A
-                        );
-
-
-                        g_playbackActive =
-                            false;
-
-
-                        g_playbackState =
-                            PLAYBACK_IDLE;
-
-
-                        UART0_writeString(
-                            "MIDI parse: FAIL\r\n"
-                        );
-                    }
-                }
-            }
-        }
+        UARTReceiver_service();
     }
 }
